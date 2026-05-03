@@ -1,0 +1,26 @@
+{
+  "expo": {
+    "plugins": [],
+    "ios": {
+      "config": {
+        "googleMapsApiKey": "YOUR_IOS_GOOGLE_MAPS_API_KEY"
+      },
+      "bundleIdentifier": "com.danieljoonlee.trainsense",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "android": {
+      "config": {
+        "googleMaps": {
+          "apiKey": "YOUR_ANDROID_GOOGLE_MAPS_API_KEY"
+        }
+      }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "22537ebd-d455-49d0-8ed4-9e9ae6caa733"
+      }
+    }
+  }
+}
