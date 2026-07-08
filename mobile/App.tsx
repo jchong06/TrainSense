@@ -3,13 +3,74 @@ import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
 import { NavigationContainer } from "@react-navigation/native";
 import { StatusBar } from "expo-status-bar";
 import React from "react";
-import { Platform, View } from "react-native";
+import { Platform, Text, TouchableOpacity, View } from "react-native";
 
 import MapScreen from "./src/screens/MapScreen";
 import RouteScreen from "./src/screens/RouteScreen";
 import SearchScreen from "./src/screens/SearchScreen";
 
 const Tab = createBottomTabNavigator();
+
+// Catches render errors from any screen so a single crash can't freeze the whole app.
+class ErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { error: Error | null }
+> {
+  state = { error: null as Error | null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidCatch(error: Error) {
+    console.error("Screen crashed:", error);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <View
+          style={{
+            flex: 1,
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 32,
+            backgroundColor: "#fafafa",
+          }}
+        >
+          <Ionicons name="warning-outline" size={56} color="#c4c4c4" />
+          <Text style={{ fontSize: 18, fontWeight: "700", color: "#1a1a1a", marginTop: 16 }}>
+            Something went wrong
+          </Text>
+          <Text
+            style={{
+              fontSize: 14,
+              color: "#6a6a6a",
+              textAlign: "center",
+              marginTop: 8,
+              maxWidth: 300,
+            }}
+          >
+            {this.state.error.message}
+          </Text>
+          <TouchableOpacity
+            onPress={() => this.setState({ error: null })}
+            style={{
+              marginTop: 24,
+              paddingVertical: 12,
+              paddingHorizontal: 24,
+              borderRadius: 14,
+              backgroundColor: "#1a1a1a",
+            }}
+          >
+            <Text style={{ color: "#fff", fontWeight: "600" }}>Try again</Text>
+          </TouchableOpacity>
+        </View>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // Custom floating tab bar with minimalist design
 function MinimalTabBar({ state, descriptors, navigation }: any) {
@@ -95,21 +156,66 @@ function MinimalTabBar({ state, descriptors, navigation }: any) {
   );
 }
 
-export default function App() {
+// On web the app otherwise stretches across the whole browser window. Wrap it in a
+// centered, phone-shaped frame so the web preview looks like a device. No-op on native.
+function PhoneFrame({ children }: { children: React.ReactNode }) {
+  if (Platform.OS !== "web") {
+    return <>{children}</>;
+  }
+
   return (
-    <NavigationContainer>
-      <StatusBar style="dark" />
-      <Tab.Navigator
-        initialRouteName="Map"
-        tabBar={(props) => <MinimalTabBar {...props} />}
-        screenOptions={{
-          headerShown: false,
+    <View
+      style={{
+        flex: 1,
+        minHeight: "100vh" as any,
+        alignItems: "center",
+        justifyContent: "center",
+        backgroundColor: "#0a0a0a",
+        padding: 24,
+      }}
+    >
+      <View
+        style={{
+          width: 390,
+          height: 844,
+          maxWidth: "100%",
+          maxHeight: "100%",
+          borderRadius: 44,
+          overflow: "hidden",
+          backgroundColor: "#ffffff",
+          borderWidth: 10,
+          borderColor: "#000000",
+          shadowColor: "#000",
+          shadowOffset: { width: 0, height: 20 },
+          shadowOpacity: 0.5,
+          shadowRadius: 40,
         }}
       >
-        <Tab.Screen name="Map" component={MapScreen} />
-        <Tab.Screen name="Lines" component={RouteScreen} />
-        <Tab.Screen name="Search" component={SearchScreen} />
-      </Tab.Navigator>
-    </NavigationContainer>
+        {children}
+      </View>
+    </View>
+  );
+}
+
+export default function App() {
+  return (
+    <PhoneFrame>
+      <ErrorBoundary>
+      <NavigationContainer>
+        <StatusBar style="dark" />
+        <Tab.Navigator
+          initialRouteName="Search"
+          tabBar={(props) => <MinimalTabBar {...props} />}
+          screenOptions={{
+            headerShown: false,
+          }}
+        >
+          <Tab.Screen name="Map" component={MapScreen} />
+          <Tab.Screen name="Lines" component={RouteScreen} />
+          <Tab.Screen name="Search" component={SearchScreen} />
+        </Tab.Navigator>
+      </NavigationContainer>
+      </ErrorBoundary>
+    </PhoneFrame>
   );
 }

@@ -22,12 +22,20 @@ import { Stop } from "../services/api";
 
 const { width, height } = Dimensions.get("window");
 
-// Initialize Mapbox with token from environment
+// Initialize Mapbox with token from environment.
+// A real token starts with "pk." and is not the local placeholder. Mounting the
+// Mapbox map with an invalid token throws (and on web crashes the whole app), so
+// we only render the map when we actually have a usable token.
 const mapboxToken = Constants.expoConfig?.extra?.mapboxAccessToken;
-if (mapboxToken) {
+const hasValidMapboxToken =
+  !!mapboxToken && mapboxToken.startsWith("pk.") && !mapboxToken.includes("placeholder");
+
+if (hasValidMapboxToken) {
   Mapbox.setAccessToken(mapboxToken);
 } else {
-  console.warn("Mapbox access token not found. Add MAPBOX_ACCESS_TOKEN to your .env file");
+  console.warn(
+    "Mapbox access token not configured. Add a real MAPBOX_ACCESS_TOKEN to mobile/.env to enable the map."
+  );
 }
 
 // Manhattan center location (Times Square area)
@@ -336,6 +344,28 @@ const MapScreen = () => {
     }
   };
 
+  // Without a valid Mapbox token the map cannot render (and would crash on web),
+  // so show a friendly placeholder instead of mounting the Mapbox MapView.
+  if (!hasValidMapboxToken) {
+    return (
+      <View style={[styles.container, styles.fallbackContainer]}>
+        <Ionicons name="map-outline" size={64} color="#c4c4c4" />
+        <Text style={styles.fallbackTitle}>Map unavailable</Text>
+        <Text style={styles.fallbackText}>
+          Add a Mapbox access token to{" "}
+          <Text style={styles.fallbackMono}>mobile/.env</Text> as{" "}
+          <Text style={styles.fallbackMono}>MAPBOX_ACCESS_TOKEN</Text> and restart to
+          enable the map.
+        </Text>
+        {processedStopsGeoJSON && processedStopsGeoJSON.features.length > 0 && (
+          <Text style={styles.fallbackCount}>
+            {processedStopsGeoJSON.features.length} stations loaded
+          </Text>
+        )}
+      </View>
+    );
+  }
+
   return (
     <View style={styles.container}>
       <MapView
@@ -518,6 +548,38 @@ const styles = StyleSheet.create({
   },
   map: {
     flex: 1,
+  },
+
+  // Fallback shown when no valid Mapbox token is configured
+  fallbackContainer: {
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 32,
+    backgroundColor: "#fafafa",
+  },
+  fallbackTitle: {
+    fontSize: 20,
+    fontWeight: "700",
+    color: "#1a1a1a",
+    marginTop: 16,
+  },
+  fallbackText: {
+    fontSize: 14,
+    lineHeight: 20,
+    color: "#6a6a6a",
+    textAlign: "center",
+    marginTop: 8,
+    maxWidth: 300,
+  },
+  fallbackMono: {
+    fontWeight: "600",
+    color: "#3a3a3a",
+  },
+  fallbackCount: {
+    marginTop: 20,
+    fontSize: 13,
+    fontWeight: "600",
+    color: "#3a3a3a",
   },
 
   // Controls
