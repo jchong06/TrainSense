@@ -1,0 +1,17 @@
+# Render.com blueprint for the TrainSense Flask API.
+# Deploy: push to GitHub, then in Render "New +" -> "Blueprint" and pick this repo.
+services:
+  - type: web
+    name: trainsense-api
+    runtime: python
+    rootDir: backend
+    plan: free
+    # Build the SQLite DB (routes, stops, trips, stop_routes) from the committed GTFS feed.
+    buildCommand: pip install -r requirements.txt && python setup_database.py
+    startCommand: gunicorn run:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: FLASK_DEBUG
+        value: "False"

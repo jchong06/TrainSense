@@ -1,5 +1,6 @@
 # backend/run.py
 # Entry point for flask application
+import os
 from app import create_app, db
 from config import Config
 
@@ -29,8 +30,9 @@ if __name__ == '__main__':
     else:
         print("Configuration issues detected")
     
+    port = int(os.environ.get('PORT', 5001))
     print(f"Starting MTA Subway Crowd Prediction API")
-    print(f"Running on: http://localhost:5001")
+    print(f"Running on: http://localhost:{port}")
     
     # app.config is a special dictionary like object in Flask that is used to store configuration variables
     # When create_app() is run, it loads config values into app.config
@@ -47,5 +49,5 @@ if __name__ == '__main__':
     app.run(
         debug=app.config['DEBUG'],
         host='0.0.0.0',
-        port=5001
+        port=port
     )
