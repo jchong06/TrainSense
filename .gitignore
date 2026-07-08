@@ -38,3 +38,7 @@ coverage/backend/instance/
 backend/venv/
 backend/instance/
 backend/venv/
+
+# Python virtualenv
+backend/.venv/
+.venv/

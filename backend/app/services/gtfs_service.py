@@ -249,6 +249,82 @@ class GTFSService:
             print(f"❌ Error committing stops to database: {e}")
             raise
     
+    def load_trips_to_db(self):
+        """Load trips from GTFS trips.txt into the database."""
+        trips_file = os.path.join(self.gtfs_dir, 'trips.txt')
+
+        if not os.path.exists(trips_file):
+            raise FileNotFoundError("trips.txt not found. Download GTFS data first.")
+
+        print("🚋 Loading trips to database...")
+
+        # Only keep trips whose route actually exists, to satisfy the FK.
+        valid_route_ids = {r.id for r in Route.query.all()}
+
+        def safe_int(value, default=None):
+            if value is None or str(value).strip() == '':
+                return default
+            try:
+                return int(value)
+            except (ValueError, TypeError):
+                return default
+
+        trips_loaded = 0
+        trips_updated = 0
+        errors = 0
+        batch = []
+        seen_ids = set()
+
+        # Wipe existing trips so re-runs stay consistent with the current feed.
+        existing_ids = {t.id for t in Trip.query.with_entities(Trip.id).all()}
+
+        with open(trips_file, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row_num, row in enumerate(reader, 1):
+                try:
+                    trip_id = (row.get('trip_id') or '').strip()
+                    route_id = (row.get('route_id') or '').strip()
+                    if not trip_id or not route_id:
+                        continue
+                    if route_id not in valid_route_ids:
+                        continue
+                    # trips.txt can list a trip_id more than once; keep the first.
+                    if trip_id in seen_ids or trip_id in existing_ids:
+                        continue
+                    seen_ids.add(trip_id)
+
+                    batch.append({
+                        'id': trip_id,
+                        'route_id': route_id,
+                        'service_id': (row.get('service_id') or '').strip(),
+                        'trip_headsign': (row.get('trip_headsign') or '').strip() or None,
+                        'direction_id': safe_int(row.get('direction_id')),
+                    })
+                    trips_loaded += 1
+
+                    if len(batch) >= 5000:
+                        db.session.bulk_insert_mappings(Trip, batch)
+                        db.session.commit()
+                        batch = []
+                except Exception as e:
+                    errors += 1
+                    if errors <= 10:
+                        print(f"⚠️  Error processing trip row {row_num}: {e}")
+                    continue
+
+        try:
+            if batch:
+                db.session.bulk_insert_mappings(Trip, batch)
+            db.session.commit()
+            print(f"✅ Trips processed: {trips_loaded} new, {trips_updated} updated")
+            if errors > 0:
+                print(f"⚠️  {errors} rows had errors and were skipped")
+            return trips_loaded, trips_updated
+        except Exception as e:
+            db.session.rollback()
+            print(f"❌ Error committing trips to database: {e}")
+            raise
+
     def load_all_gtfs_data(self, force_download=False):
         """Download and load all GTFS data"""
         try:

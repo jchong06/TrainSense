@@ -71,52 +71,56 @@ def import_mta_data():
         return False
 
 def create_stop_route_relationships():
-    """Create stop-route relationships from trips and stop times"""
+    """Create real stop-route relationships from stop_times.txt joined with trips.
+
+    Reads which stops each trip visits (stop_times.txt) and maps each trip to its
+    route (trips table), producing the distinct set of (route_id, stop_id) pairs
+    that the trip planner uses to build its graph.
+    """
     try:
         logger.info("Creating stop-route relationships...")
-        
-        # Get all trips
-        trips = Trip.query.all()
-        
-        # Create a mapping of trip_id to route_id
-        trip_route_map = {}
-        for trip in trips:
-            trip_route_map[trip.id] = trip.route_id
-        
-        # For now, create some basic relationships
-        # In a real implementation, you'd load stop_times.txt and create relationships
-        count = 0
-        
-        # Get some sample stops and routes to create relationships
-        stops = Stop.query.limit(100).all()  # Get first 100 stops
-        routes = Route.query.filter_by(route_type=1).all()  # Get subway routes
-        
-        # Create some sample relationships (this is simplified)
-        for stop in stops:
-            # Assign 1-3 random routes to each stop
-            import random
-            num_routes = random.randint(1, min(3, len(routes)))
-            selected_routes = random.sample(routes, num_routes)
-            
-            for route in selected_routes:
-                # Check if relationship already exists
-                existing = StopRoute.query.filter_by(
-                    stop_id=stop.id, 
-                    route_id=route.id
-                ).first()
-                
-                if not existing:
-                    stop_route = StopRoute(
-                        stop_id=stop.id,
-                        route_id=route.id
-                    )
-                    db.session.add(stop_route)
-                    count += 1
-        
+
+        gtfs_dir = GTFSService().gtfs_dir
+        stop_times_file = os.path.join(gtfs_dir, 'stop_times.txt')
+        if not os.path.exists(stop_times_file):
+            logger.error("stop_times.txt not found; cannot build stop-route relationships")
+            return 0
+
+        # trip_id -> route_id (from the trips already loaded into the DB)
+        trip_route_map = {t.id: t.route_id for t in Trip.query.all()}
+        if not trip_route_map:
+            logger.error("No trips in database; load trips before building relationships")
+            return 0
+
+        # Only reference stops/routes that exist, to satisfy foreign keys.
+        valid_stop_ids = {s.id for s in Stop.query.with_entities(Stop.id).all()}
+        valid_route_ids = {r.id for r in Route.query.with_entities(Route.id).all()}
+
+        # Collect the distinct (route_id, stop_id) pairs actually served.
+        import csv
+        pairs = set()
+        with open(stop_times_file, 'r', encoding='utf-8') as f:
+            for row in csv.DictReader(f):
+                route_id = trip_route_map.get(row['trip_id'])
+                if not route_id or route_id not in valid_route_ids:
+                    continue
+                stop_id = row['stop_id'].strip()
+                if stop_id in valid_stop_ids:
+                    pairs.add((route_id, stop_id))
+
+        # Replace any existing relationships with the freshly computed set.
+        StopRoute.query.delete()
         db.session.commit()
+
+        mappings = [{'stop_id': s, 'route_id': r} for (r, s) in pairs]
+        for i in range(0, len(mappings), 10000):
+            db.session.bulk_insert_mappings(StopRoute, mappings[i:i + 10000])
+            db.session.commit()
+
+        count = len(mappings)
         logger.info(f"Created {count} stop-route relationships")
         return count
-        
+
     except Exception as e:
         logger.error(f"Error creating stop-route relationships: {e}")
         db.session.rollback()

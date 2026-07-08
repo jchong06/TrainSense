@@ -30,7 +30,7 @@ if __name__ == '__main__':
         print("Configuration issues detected")
     
     print(f"Starting MTA Subway Crowd Prediction API")
-    print(f"Running on: http://localhost:5000")
+    print(f"Running on: http://localhost:5001")
     
     # app.config is a special dictionary like object in Flask that is used to store configuration variables
     # When create_app() is run, it loads config values into app.config
