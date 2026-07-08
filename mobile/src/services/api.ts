@@ -1,5 +1,9 @@
 // API Configuration
-const API_BASE_URL = 'http://127.0.0.1:5001/api';
+// In production the deployed backend URL is injected at build time via
+// EXPO_PUBLIC_API_URL (e.g. https://trainsense-api.onrender.com/api).
+// Falls back to the local dev server.
+const API_BASE_URL =
+  process.env.EXPO_PUBLIC_API_URL ?? 'http://127.0.0.1:5001/api';
 
 // Types for API responses
 export interface Route {
