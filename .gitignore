@@ -42,3 +42,5 @@ backend/venv/
 # Python virtualenv
 backend/.venv/
 .venv/
+.vercel
+.env*
