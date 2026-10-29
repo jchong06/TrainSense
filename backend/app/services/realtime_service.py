@@ -140,6 +140,47 @@ class RealtimeDataService:
             logger.error(f"Error getting arrivals for stop {stop_id}: {e}")
             return []
     
+    def get_arrivals_for_stops(self, stop_ids):
+        """
+        Get real-time arrivals for a group of stops (e.g. every platform of a transfer hub)
+        with a handful of queries and a single pass over each relevant feed.
+        """
+        try:
+            # Expand to child platforms and directional (N/S/E/W) stops
+            stop_ids = set(stop_ids)
+            stop_ids |= {s.id for s in Stop.query.filter(Stop.parent_station.in_(stop_ids)).all()}
+            candidates = {sid + suffix for sid in stop_ids for suffix in ['N', 'S', 'E', 'W']}
+            stops = Stop.query.filter(Stop.id.in_(stop_ids | candidates)).all()
+            stop_ids |= {s.id for s in stops}
+            parent_of = {s.id: s.parent_station or s.id for s in stops}
+
+            # Routes serving any of these stops decide which feeds to read
+            route_ids = {sr.route_id for sr in StopRoute.query.filter(StopRoute.stop_id.in_(stop_ids)).all()}
+            feeds_to_check = [feed_id for feed_id, routes in self.FEED_MAPPINGS.items()
+                              if any(route in routes for route in route_ids)]
+            if not feeds_to_check:
+                feeds_to_check = list(self.FEED_MAPPINGS.keys())  # fallback: check all feeds
+
+            # Download the needed feeds in parallel (served from cache when fresh)
+            with ThreadPoolExecutor(max_workers=len(feeds_to_check)) as pool:
+                feeds = [f for f in pool.map(self._get_feed_data, feeds_to_check) if f]
+
+            # Keep the soonest arrival per (trip_id, route, direction, parent_station)
+            trip_arrivals = {}
+            for feed_data in feeds:
+                for arrival in self._process_trip_updates_for_stops(feed_data, stop_ids, route_ids):
+                    parent_station = parent_of.get(arrival['stop_id'], arrival['stop_id'])
+                    key = (arrival['trip_id'], arrival['route'], arrival['direction'], parent_station)
+                    if key not in trip_arrivals or arrival['arrival_time'] < trip_arrivals[key]['arrival_time']:
+                        trip_arrivals[key] = arrival
+
+            arrivals = sorted(trip_arrivals.values(), key=lambda x: x.get('arrival_time', 0))
+            logger.info(f"Total arrivals found for {len(stop_ids)} stops: {len(arrivals)}")
+            return arrivals
+        except Exception as e:
+            logger.error(f"Error getting arrivals for stops {stop_ids}: {e}")
+            return []
+
     def get_route_status(self, route_id):
         """Get service status for a specific route"""
         try:
@@ -406,13 +447,17 @@ class RealtimeDataService:
 
     def _process_trip_updates_for_stop(self, trip_updates, stop_id, route_ids=None):
         """Process trip updates to find arrivals for a specific stop"""
+        return self._process_trip_updates_for_stops(trip_updates, {stop_id}, route_ids)
+
+    def _process_trip_updates_for_stops(self, trip_updates, stop_ids, route_ids=None):
+        """
+        Process trip updates in one pass to find arrivals at any of stop_ids.
+        Each arrival is tagged with the platform 'stop_id' it was found at.
+        """
         arrivals = []
         current_time = int(time.time())
-        found_stops = set()
         
         try:
-            logger.info(f"Processing trip updates for stop {stop_id}")
-            
             for entity in trip_updates.entity:
                 if not entity.HasField('trip_update'):
                     continue
@@ -426,44 +471,36 @@ class RealtimeDataService:
                 
                 # Process stop time updates
                 for stop_time_update in trip_update.stop_time_update:
-                    found_stops.add(stop_time_update.stop_id)
+                    stop_id = stop_time_update.stop_id
+                    if stop_id not in stop_ids or not stop_time_update.HasField('arrival'):
+                        continue
+
+                    # Calculate arrival time
+                    arrival_time = stop_time_update.arrival.time
+                    minutes = max(0, (arrival_time - current_time) // 60)
                     
-                    if stop_time_update.stop_id == stop_id:
-                        logger.info(f"Found matching stop {stop_id} in trip {trip.trip_id}")
+                    # Only include arrivals in the next 30 minutes
+                    if 0 <= minutes <= 30:
+                        # Determine direction based on stop ID suffix
+                        direction = self._get_direction_from_stop_id(stop_id, trip)
                         
-                        # Calculate arrival time
-                        if stop_time_update.HasField('arrival'):
-                            arrival_time = stop_time_update.arrival.time
-                            minutes = max(0, (arrival_time - current_time) // 60)
-                            
-                            # Only include arrivals in the next 30 minutes
-                            if 0 <= minutes <= 30:
-                                # Determine direction based on stop ID suffix
-                                direction = self._get_direction_from_stop_id(stop_id, trip)
-                                
-                                # Determine status based on arrival time
-                                if minutes == 0:
-                                    status = 'Arriving'
-                                elif minutes <= 3:
-                                    status = 'Approaching'
-                                else:
-                                    status = self._get_status_from_delay(stop_time_update)
-                                
-                                arrival = {
-                                    'route': trip.route_id,
-                                    'minutes': minutes,
-                                    'arrival_time': arrival_time,
-                                    'direction': direction,
-                                    'status': status,
-                                    'trip_id': trip.trip_id
-                                }
-                                arrivals.append(arrival)
-                                logger.info(f"Added arrival: {arrival}")
-            
-            # Log some sample stop IDs for debugging
-            sample_stops = list(found_stops)[:10]
-            logger.info(f"Sample stop IDs in real-time data: {sample_stops}")
-            logger.info(f"Looking for stop {stop_id}, found {len(arrivals)} arrivals")
+                        # Determine status based on arrival time
+                        if minutes == 0:
+                            status = 'Arriving'
+                        elif minutes <= 3:
+                            status = 'Approaching'
+                        else:
+                            status = self._get_status_from_delay(stop_time_update)
+                        
+                        arrivals.append({
+                            'route': trip.route_id,
+                            'minutes': minutes,
+                            'arrival_time': arrival_time,
+                            'direction': direction,
+                            'status': status,
+                            'trip_id': trip.trip_id,
+                            'stop_id': stop_id,
+                        })
         
         except Exception as e:
             logger.error(f"Error processing trip updates: {e}")

@@ -164,38 +164,8 @@ def get_realtime_updates(stop_id):
                 if h == hub_id and s != stop_id:
                     stop_ids.append(s)
         
-        # If this is a parent station, add all child stops
-        child_stops = Stop.query.filter(Stop.parent_station == stop_id).all()
-        stop_ids += [child.id for child in child_stops]
-        
-        # Also add directional stops (N/S/E/W suffixes) if not already included
-        for suffix in ['N', 'S', 'E', 'W']:
-            dir_stop_id = stop_id + suffix
-            if dir_stop_id not in stop_ids:
-                dir_stop = Stop.query.get(dir_stop_id)
-                if dir_stop:
-                    stop_ids.append(dir_stop_id)
-        
-        # Remove duplicates
-        stop_ids = list(set(stop_ids))
-        
-        # Get all unique routes that serve any of these stops
-        route_ids = set()
-        for sid in stop_ids:
-            s = Stop.query.get(sid)
-            if s:
-                for route in s.get_routes():
-                    route_ids.add(route.id)
-        route_ids = list(route_ids)
-        
-        # Get real-time data for all these stop IDs
-        realtime_service = RealtimeDataService()
-        all_arrivals = []
-        for sid in stop_ids:
-            arrivals = realtime_service.get_arrivals_for_stop(sid, route_ids)
-            for arr in arrivals:
-                arr['stop_id'] = sid  # Tag which platform this arrival is for
-            all_arrivals.extend(arrivals)
+        # Get real-time data for all these stops (child platforms are added by the service)
+        all_arrivals = RealtimeDataService().get_arrivals_for_stops(stop_ids)
         
         # Sort by soonest arrival
         all_arrivals.sort(key=lambda x: x.get('arrival_time', 0))
