@@ -1,0 +1,8 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "cd mobile && npm install",
+  "buildCommand": "cd mobile && EXPO_PUBLIC_API_URL=${EXPO_PUBLIC_API_URL:-https://trainsense-api.onrender.com/api} npx expo export -p web",
+  "outputDirectory": "mobile/dist",
+  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
+}
