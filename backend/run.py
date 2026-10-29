@@ -1,6 +1,7 @@
 # backend/run.py
 # Entry point for flask application
 import os
+import threading
 from app import create_app, db
 from config import Config
 
@@ -9,6 +10,10 @@ from app.models.transit import Route, Stop, Trip
 
 # Create Flask app
 app = create_app()
+
+# Build the static-data caches in the background so the first real requests are fast
+from app.routes.transit_routes import warm_caches
+threading.Thread(target=warm_caches, args=(app,), daemon=True).start()
 
 # Preload the configuration for flask shell
 @app.shell_context_processor

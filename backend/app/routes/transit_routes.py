@@ -11,6 +11,8 @@ import logging
 import csv
 import os
 from collections import defaultdict, deque
+from functools import lru_cache
+from sqlalchemy.orm import joinedload
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -48,45 +50,9 @@ def get_routes():
 def get_stops():
     """Get all subway stops"""
     try:
-        # Get only stops that are stations (location_type = 1) or have parent stations
-        stops = Stop.query.filter(
-            (Stop.location_type == 1) | (Stop.parent_station.isnot(None))
-        ).all()
-        
-        # Group stops by parent station to avoid duplicates
-        station_dict = {}
-        for stop in stops:
-            station_id = stop.parent_station or stop.id
-            if station_id not in station_dict:
-                station_dict[station_id] = stop
-        
-        # Convert to list and add route information
-        stations = []
-        for stop in station_dict.values():
-            stop_data = stop.to_dict()
-            # Get routes that serve this stop
-            routes = stop.get_routes()
-            
-            # If no routes found for the main stop, check directional stops
-            if not routes:
-                # Look for directional stops (N/S suffixes)
-                directional_stops = Stop.query.filter(
-                    (Stop.id == stop.id + 'N') | (Stop.id == stop.id + 'S')
-                ).all()
-                
-                for dir_stop in directional_stops:
-                    dir_routes = dir_stop.get_routes()
-                    for route in dir_routes:
-                        # Check if route already added
-                        if not any(r.id == route.id for r in routes):
-                            routes.append(route)
-            
-            stop_data['routes'] = [route.to_dict() for route in routes]
-            stations.append(stop_data)
-        
         return jsonify({
             'success': True,
-            'data': stations
+            'data': _station_list()
         })
     except Exception as e:
         logger.error(f"Error fetching stops: {e}")
@@ -184,43 +150,8 @@ def get_realtime_updates(stop_id):
                 'error': 'Stop not found'
             }), 404
         
-        # --- 1. Build transfer groups from transfers.txt (same logic as /map/stations) ---
-        gtfs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'gtfs')
-        transfers_file = os.path.join(gtfs_dir, 'transfers.txt')
-        transfer_graph = defaultdict(set)
-        if os.path.exists(transfers_file):
-            with open(transfers_file, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    from_stop = row['from_stop_id']
-                    to_stop = row['to_stop_id']
-                    transfer_graph[from_stop].add(to_stop)
-                    transfer_graph[to_stop].add(from_stop)
-        
-        # Find connected components (transfer hubs)
-        stop_to_hub = {}
-        hub_id_counter = 1
-        visited = set()
-        for s in transfer_graph:
-            if s in visited:
-                continue
-            # BFS to find all connected stops
-            queue = deque([s])
-            group = set()
-            while queue:
-                current_stop = queue.popleft()
-                if current_stop in visited:
-                    continue
-                visited.add(current_stop)
-                group.add(current_stop)
-                for neighbor in transfer_graph[current_stop]:
-                    if neighbor not in visited:
-                        queue.append(neighbor)
-            # Assign a hub_id to all stops in this group
-            hub_id = f"hub_{hub_id_counter}"
-            for s in group:
-                stop_to_hub[s] = hub_id
-            hub_id_counter += 1
+        # --- 1. Transfer groups (cached; static GTFS data) ---
+        stop_to_hub = _build_transfer_groups()
         
         # --- 2. Gather all relevant stop IDs ---
         stop_ids = [stop_id]
@@ -300,6 +231,10 @@ def _find_gtfs_dir():
     return candidates[0]
 
 
+# The helpers below derive data from the static GTFS feed / database, which doesn't
+# change while the server runs, so each is computed once per process and cached.
+
+@lru_cache(maxsize=None)
 def _build_transfer_groups():
     """
     Read transfers.txt and return a dict: station_id -> hub_id (int).
@@ -334,22 +269,87 @@ def _build_transfer_groups():
     return stop_to_hub
 
 
-def _build_route_stations_map(stop_to_hub):
+@lru_cache(maxsize=None)
+def _build_route_stations_map():
     """
     Return a dict: route_id -> set of canonical node IDs served by that route.
     Collapses all platforms at a transfer hub into one node.
     """
+    stop_to_hub = _build_transfer_groups()
     route_stations = defaultdict(set)
-    for sr in StopRoute.query.all():
-        stop = Stop.query.get(sr.stop_id)
+    for sr in StopRoute.query.options(joinedload(StopRoute.stop)).all():
+        stop = sr.stop
         if not stop:
             continue
         parent = _get_parent_id(stop)
         node = f"hub_{stop_to_hub[parent]}" if parent in stop_to_hub else parent
         route_stations[sr.route_id].add(node)
-    return route_stations
+    return dict(route_stations)
 
 
+@lru_cache(maxsize=None)
+def _build_node_routes_map():
+    """Return a dict: node -> set of route IDs serving it (inverse of the route stations map)."""
+    node_routes = defaultdict(set)
+    for route_id, nodes in _build_route_stations_map().items():
+        for node in nodes:
+            node_routes[node].add(route_id)
+    return dict(node_routes)
+
+
+@lru_cache(maxsize=None)
+def _routes_by_stop():
+    """Return a dict: stop_id -> [Route, ...] in a single query."""
+    routes = defaultdict(list)
+    for sr in StopRoute.query.options(joinedload(StopRoute.route)).all():
+        routes[sr.stop_id].append(sr.route)
+    return routes
+
+
+@lru_cache(maxsize=None)
+def _station_list():
+    """All stations (one per parent station) with the routes serving them."""
+    stops = Stop.query.filter(
+        (Stop.location_type == 1) | (Stop.parent_station.isnot(None))
+    ).all()
+
+    # Group stops by parent station to avoid duplicates
+    station_dict = {}
+    for stop in stops:
+        station_id = stop.parent_station or stop.id
+        if station_id not in station_dict:
+            station_dict[station_id] = stop
+
+    routes_by_stop = _routes_by_stop()
+    stations = []
+    for stop in station_dict.values():
+        stop_data = stop.to_dict()
+        routes = list(routes_by_stop.get(stop.id, []))
+        # If no routes found for the main stop, check directional stops (N/S suffixes)
+        if not routes:
+            for dir_id in (stop.id + 'N', stop.id + 'S'):
+                for route in routes_by_stop.get(dir_id, []):
+                    if not any(r.id == route.id for r in routes):
+                        routes.append(route)
+        stop_data['routes'] = [route.to_dict() for route in routes]
+        stations.append(stop_data)
+    return stations
+
+
+@lru_cache(maxsize=None)
+def _map_station_list():
+    """Station list for the map, with each station tagged by its transfer hub."""
+    stop_to_hub = _build_transfer_groups()
+    stations = []
+    for station in _station_list():
+        hub = stop_to_hub.get(station['id'])
+        if hub is None and station.get('parent_station'):
+            hub = stop_to_hub.get(station['parent_station'])
+        stations.append({**station, 'hub_id': f"hub_{hub}" if hub is not None else f"hub_{station['id']}"})
+    return stations
+
+
+@lru_cache(maxsize=None)
 def _build_stop_count_lookup():
     """
     Return a dict: (route_id, node_a, node_b) -> stop_count between them.
@@ -365,26 +365,17 @@ def _build_stop_count_lookup():
         for row in csv.DictReader(f):
             trip_to_route[row['trip_id']] = row['route_id']
 
-    # Build route_id -> {trip_id -> [(seq, stop_id), ...]}
-    route_trip_stops = defaultdict(lambda: defaultdict(list))
+    # Collect every sequence number seen for each stop on each route, across all trips
+    route_stop_seqs = defaultdict(lambda: defaultdict(list))
     with open(os.path.join(gtfs_dir, 'stop_times.txt'), encoding='utf-8') as f:
         for row in csv.DictReader(f):
             route_id = trip_to_route.get(row['trip_id'])
             if route_id:
-                route_trip_stops[route_id][row['trip_id']].append(
-                    (int(row['stop_sequence']), row['stop_id'])
-                )
+                route_stop_seqs[route_id][row['stop_id']].append(int(row['stop_sequence']))
 
-    # For each route, build a stop_id -> median sequence position map
-    # Then lookup count = |seq_a - seq_b|
-    # Store as route_id -> {stop_id -> representative_sequence}
+    # route_id -> {stop_id -> median sequence position}; count = |seq_a - seq_b|
     route_stop_seq = defaultdict(dict)
-    for route_id, trips in route_trip_stops.items():
-        # Collect all sequence numbers seen for each stop across all trips
-        stop_seqs = defaultdict(list)
-        for trip_id, stops in trips.items():
-            for seq, stop_id in stops:
-                stop_seqs[stop_id].append(seq)
+    for route_id, stop_seqs in route_stop_seqs.items():
         for stop_id, seqs in stop_seqs.items():
             route_stop_seq[route_id][stop_id] = sorted(seqs)[len(seqs) // 2]  # median
 
@@ -410,9 +401,9 @@ def _get_station_node(station_id, stop_to_hub):
     return f"hub_{stop_to_hub[station_id]}" if station_id in stop_to_hub else station_id
 
 
-def _get_node_routes(node, route_stations_map):
+def _get_node_routes(node):
     """Return all route IDs that serve a node."""
-    return {route_id for route_id, nodes in route_stations_map.items() if node in nodes}
+    return _build_node_routes_map().get(node, set())
 
 
 # Routes that share the same physical track and are interchangeable for planning
@@ -458,7 +449,7 @@ def _bfs_all_paths(origin_node, dest_node, route_stations_map):
             if len(legs) >= max_legs:
                 continue
 
-            for route_id in _get_node_routes(node, route_stations_map):
+            for route_id in _get_node_routes(node):
                 for next_node in route_stations_map.get(route_id, set()):
                     if next_node == node:
                         continue
@@ -524,7 +515,7 @@ def plan_trip():
         for stop_id, hub_id in stop_to_hub.items():
             hub_to_stops[hub_id].append(stop_id)
 
-        route_stations_map = _build_route_stations_map(stop_to_hub)
+        route_stations_map = _build_route_stations_map()
         route_stop_seq = _build_stop_count_lookup()
 
         origin_node = _get_station_node(origin_parent, stop_to_hub)
@@ -607,95 +598,9 @@ def plan_trip():
 def get_map_stations():
     """Get all stations for the map view, with transfer hub grouping"""
     try:
-        # --- 1. Build transfer groups from transfers.txt ---
-        gtfs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'gtfs')
-        transfers_file = os.path.join(gtfs_dir, 'transfers.txt')
-        transfer_graph = defaultdict(set)
-        if os.path.exists(transfers_file):
-            with open(transfers_file, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    from_stop = row['from_stop_id']
-                    to_stop = row['to_stop_id']
-                    transfer_graph[from_stop].add(to_stop)
-                    transfer_graph[to_stop].add(from_stop)
-        
-        # Find connected components (transfer hubs)
-        stop_to_hub = {}
-        hub_id_counter = 1
-        visited = set()
-        for stop in transfer_graph:
-            if stop in visited:
-                continue
-            # BFS to find all connected stops
-            queue = deque([stop])
-            group = set()
-            while queue:
-                s = queue.popleft()
-                if s in visited:
-                    continue
-                visited.add(s)
-                group.add(s)
-                for neighbor in transfer_graph[s]:
-                    if neighbor not in visited:
-                        queue.append(neighbor)
-            # Assign a hub_id to all stops in this group
-            hub_id = f"hub_{hub_id_counter}"
-            for s in group:
-                stop_to_hub[s] = hub_id
-            hub_id_counter += 1
-        # Stops not in any transfer group get their own hub_id
-        # (single stations)
-        # --- 2. Get all stops that are stations or have parent stations ---
-        stops = Stop.query.filter(
-            (Stop.location_type == 1) | (Stop.parent_station.isnot(None))
-        ).all()
-        
-        # Group by parent station to avoid duplicates
-        station_dict = {}
-        for stop in stops:
-            station_id = stop.parent_station or stop.id
-            if station_id not in station_dict:
-                station_dict[station_id] = stop
-        
-        # Convert to list and add route information
-        stations = []
-        for stop in station_dict.values():
-            stop_data = stop.to_dict()
-            # Get routes that serve this stop
-            routes = stop.get_routes()
-            
-            # If no routes found for the main stop, check directional stops
-            if not routes:
-                # Look for directional stops (N/S suffixes)
-                directional_stops = Stop.query.filter(
-                    (Stop.id == stop.id + 'N') | (Stop.id == stop.id + 'S')
-                ).all()
-                
-                for dir_stop in directional_stops:
-                    dir_routes = dir_stop.get_routes()
-                    for route in dir_routes:
-                        # Check if route already added
-                        if not any(r.id == route.id for r in routes):
-                            routes.append(route)
-            stop_data['routes'] = [route.to_dict() for route in routes]
-            # Assign hub_id: use stop.id or parent_station, then map to hub_id
-            sid = stop.id
-            hub_id = stop_to_hub.get(sid)
-            if not hub_id:
-                # Try parent_station
-                parent = stop.parent_station
-                if parent:
-                    hub_id = stop_to_hub.get(parent)
-            if not hub_id:
-                # Not in any group, assign unique
-                hub_id = f"hub_{sid}"
-            stop_data['hub_id'] = hub_id
-            stations.append(stop_data)
-        
         return jsonify({
             'success': True,
-            'data': stations
+            'data': _map_station_list()
         })
     except Exception as e:
         logger.error(f"Error fetching map stations: {e}")
@@ -1083,3 +988,14 @@ def get_trunk_shapes():
                         })
     
     return jsonify({'success': True, 'data': trunk_segments}) 
+
+def warm_caches(app):
+    """Precompute the cached station lists and trip-planning graph so first requests are fast."""
+    with app.app_context():
+        try:
+            _map_station_list()
+            _build_node_routes_map()
+            _build_stop_count_lookup()
+            logger.info("Transit caches warmed")
+        except Exception as e:
+            logger.error(f"Error warming caches: {e}")
