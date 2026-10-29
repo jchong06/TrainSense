@@ -749,8 +749,8 @@ def get_data_stats():
             'error': str(e)
         }), 500
 
-@transit_bp.route('/route-shape/<route_id>', methods=['GET'])
-def get_route_shape(route_id):
+@lru_cache(maxsize=None)
+def _route_shape_payload(route_id):
     """Return the ordered shape points for a route (using shapes.txt)"""
     # Find a representative shape_id for this route from trips.txt
     gtfs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'gtfs')
@@ -765,10 +765,10 @@ def get_route_shape(route_id):
                     shape_id = row['shape_id']
                     break
     except Exception as e:
-        return jsonify({'success': False, 'error': f'Error reading trips.txt: {e}'})
+        return {'success': False, 'error': f'Error reading trips.txt: {e}'}
 
     if not shape_id:
-        return jsonify({'success': False, 'error': 'No shape_id found for this route'})
+        return {'success': False, 'error': 'No shape_id found for this route'}
 
     # Get all shape points for this shape_id, ordered by shape_pt_sequence
     shape_points = []
@@ -784,45 +784,63 @@ def get_route_shape(route_id):
                     })
         shape_points.sort(key=lambda x: x['seq'])
     except Exception as e:
-        return jsonify({'success': False, 'error': f'Error reading shapes.txt: {e}'})
+        return {'success': False, 'error': f'Error reading shapes.txt: {e}'}
 
-    return jsonify({'success': True, 'data': [{'latitude': pt['lat'], 'longitude': pt['lon']} for pt in shape_points]})
+    return {'success': True, 'data': [{'latitude': pt['lat'], 'longitude': pt['lon']} for pt in shape_points]}
 
-@transit_bp.route('/route-stations/<route_id>', methods=['GET'])
-def get_route_stations(route_id):
+@transit_bp.route('/route-shape/<route_id>', methods=['GET'])
+def get_route_shape(route_id):
+    return jsonify(_route_shape_payload(route_id))
+
+
+@lru_cache(maxsize=None)
+def _longest_trip_stops_by_route():
+    """
+    Return a dict: route_id -> ordered stop IDs of that route's longest trip (most stops).
+    Two passes over stop_times.txt so only the chosen trips are held in memory.
+    """
+    gtfs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'gtfs')
+    trip_to_route = {}
+    with open(os.path.join(gtfs_dir, 'trips.txt'), 'r', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            trip_to_route[row['trip_id']] = row['route_id']
+
+    stop_times_file = os.path.join(gtfs_dir, 'stop_times.txt')
+    trip_counts = defaultdict(int)
+    with open(stop_times_file, 'r', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            if row['trip_id'] in trip_to_route:
+                trip_counts[row['trip_id']] += 1
+
+    longest = {}  # route_id -> trip_id (first trip seen wins ties)
+    for trip_id, count in trip_counts.items():
+        route_id = trip_to_route[trip_id]
+        if route_id not in longest or count > trip_counts[longest[route_id]]:
+            longest[route_id] = trip_id
+
+    chosen = {trip_id: route_id for route_id, trip_id in longest.items()}
+    route_stops = defaultdict(list)
+    with open(stop_times_file, 'r', encoding='utf-8') as f:
+        for row in csv.DictReader(f):
+            route_id = chosen.get(row['trip_id'])
+            if route_id:
+                route_stops[route_id].append((int(row['stop_sequence']), row['stop_id']))
+    return {route_id: [sid for _, sid in sorted(stops)] for route_id, stops in route_stops.items()}
+
+
+@lru_cache(maxsize=None)
+def _route_stations_payload(route_id):
     """
     Return the ordered list of consecutive stations for a route using stop_times.txt and trips.txt.
     Combines stops from all trip patterns for the route to show the complete route.
     """
     gtfs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'gtfs')
-    trips_file = os.path.join(gtfs_dir, 'trips.txt')
-    stop_times_file = os.path.join(gtfs_dir, 'stop_times.txt')
     stops_file = os.path.join(gtfs_dir, 'stops.txt')
 
-    # 1. Find ALL trip_ids for this route
-    trip_ids = []
-    try:
-        with open(trips_file, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if row['route_id'] == route_id:
-                    trip_ids.append(row['trip_id'])
-    except Exception as e:
-        return jsonify({'success': False, 'error': f'Error reading trips.txt: {e}'})
-
-    if not trip_ids:
-        return jsonify({'success': False, 'error': 'No trip_ids found for this route'})
-
-    # 2. Get all stop sequences for all trips
-    all_stop_sequences = []
-    try:
-        with open(stop_times_file, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if row['trip_id'] in trip_ids:
-                    all_stop_sequences.append((int(row['stop_sequence']), row['stop_id'], row['trip_id']))
-    except Exception as e:
-        return jsonify({'success': False, 'error': f'Error reading stop_times.txt: {e}'})
+    # 1-2. Ordered stop IDs of the route's longest trip (precomputed for all routes)
+    stop_ids = _longest_trip_stops_by_route().get(route_id)
+    if not stop_ids:
+        return {'success': False, 'error': 'No trip_ids found for this route'}
 
     # 3. Get full stop information for each stop_id
     stop_info = {}
@@ -838,27 +856,9 @@ def get_route_stations(route_id):
                     'parent_station': row.get('parent_station') or row['stop_id']
                 }
     except Exception as e:
-        return jsonify({'success': False, 'error': f'Error reading stops.txt: {e}'})
+        return {'success': False, 'error': f'Error reading stops.txt: {e}'}
 
-    # 4. Group stops by trip and find the longest/most complete trip pattern
-    trip_stops = {}
-    for seq, stop_id, trip_id in all_stop_sequences:
-        if trip_id not in trip_stops:
-            trip_stops[trip_id] = []
-        trip_stops[trip_id].append((seq, stop_id))
-    
-    # Sort each trip's stops by sequence
-    for trip_id in trip_stops:
-        trip_stops[trip_id].sort()
-        trip_stops[trip_id] = [sid for _, sid in trip_stops[trip_id]]
-
-    # 5. Find the trip with the most stops (most complete route)
-    if not trip_stops:
-        return jsonify({'success': False, 'error': 'No valid stop sequences found for the provided trip IDs.'})
-    longest_trip = max(trip_stops.keys(), key=lambda t: len(trip_stops[t]))
-    stop_ids = trip_stops[longest_trip]
-
-    # 6. Only include unique parent stations in order (to avoid platform duplicates)
+    # 4. Only include unique parent stations in order (to avoid platform duplicates)
     seen = set()
     ordered_stops = []
     
@@ -871,7 +871,12 @@ def get_route_stations(route_id):
             ordered_stops.append(info)
             seen.add(parent)
 
-    return jsonify({'success': True, 'data': ordered_stops})
+    return {'success': True, 'data': ordered_stops}
+
+@transit_bp.route('/route-stations/<route_id>', methods=['GET'])
+def get_route_stations(route_id):
+    return jsonify(_route_stations_payload(route_id))
+
 
 @transit_bp.route('/trunk-shapes', methods=['GET'])
 def get_trunk_shapes():
@@ -996,6 +1001,7 @@ def warm_caches(app):
             _map_station_list()
             _build_node_routes_map()
             _build_stop_count_lookup()
+            _longest_trip_stops_by_route()
             logger.info("Transit caches warmed")
         except Exception as e:
             logger.error(f"Error warming caches: {e}")
