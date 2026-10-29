@@ -2,11 +2,20 @@ from datetime import datetime, timedelta
 import time
 import requests
 import logging
+import threading
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from flask import current_app
 from google.transit import gtfs_realtime_pb2
 from app.models.transit import Route, Stop, Trip, StopRoute
 
 logger = logging.getLogger(__name__)
+
+# MTA feeds refresh roughly every 30s, so share each download across requests briefly
+# instead of re-fetching it for every platform of every station lookup.
+_FEED_TTL_SECONDS = 20
+_feed_cache = {}  # url -> (fetched_at, FeedMessage)
+_feed_locks = defaultdict(threading.Lock)
 
 class RealtimeDataService:
     """Service for handling MTA real-time data"""
@@ -92,8 +101,12 @@ class RealtimeDataService:
             # Process all feeds and collect all potential arrivals
             all_potential_arrivals = []
             
+            # Download the needed feeds in parallel (served from cache when fresh)
+            with ThreadPoolExecutor(max_workers=len(feeds_to_check)) as pool:
+                feeds = dict(zip(feeds_to_check, pool.map(self._get_feed_data, feeds_to_check)))
+
             for feed_id in feeds_to_check:
-                feed_data = self._get_feed_data(feed_id)
+                feed_data = feeds[feed_id]
                 if feed_data:
                     # Log all stop IDs found in this feed for debugging
                     for entity in feed_data.entity:
@@ -179,16 +192,22 @@ class RealtimeDataService:
             if self.api_key:
                 headers['x-api-key'] = self.api_key
             
-            logger.info(f"Fetching feed {feed_id} from {url}")
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            
-            # Parse protobuf data
-            feed = gtfs_realtime_pb2.FeedMessage()
-            feed.ParseFromString(response.content)
-            
-            logger.info(f"Successfully parsed feed {feed_id} with {len(feed.entity)} entities")
-            return feed
+            with _feed_locks[url]:
+                cached = _feed_cache.get(url)
+                if cached and time.time() - cached[0] < _FEED_TTL_SECONDS:
+                    return cached[1]
+
+                logger.info(f"Fetching feed {feed_id} from {url}")
+                response = requests.get(url, headers=headers, timeout=10)
+                response.raise_for_status()
+                
+                # Parse protobuf data
+                feed = gtfs_realtime_pb2.FeedMessage()
+                feed.ParseFromString(response.content)
+                
+                logger.info(f"Successfully parsed feed {feed_id} with {len(feed.entity)} entities")
+                _feed_cache[url] = (time.time(), feed)
+                return feed
             
         except Exception as e:
             logger.error(f"Error fetching feed {feed_id}: {e}")
